@@ -46,6 +46,24 @@ PI_USER = os.environ.get("BBB_MAINT_USER", "pi")
 MAX_FILE_BYTES = 64 * 1024
 MAX_UPDATE_BYTES = int(os.environ.get("BBB_MAINT_MAX_UPDATE_BYTES", str(40 * 1024 * 1024)))
 UPDATE_ROOT = Path(os.environ.get("BBB_MAINT_UPDATE_ROOT", "/home/pi/.rotorsync-maintenance-updates"))
+APPLY_HELPER = os.environ.get("BBB_MAINT_APPLY_HELPER", "/opt/rotorsync-maint-apply")
+APPLY_HELPER_PYTHON = os.environ.get("BBB_MAINT_APPLY_PYTHON", "/usr/bin/python3")
+SUDO_BIN = os.environ.get(
+    "BBB_MAINT_SUDO",
+    "/usr/bin/sudo.ws" if Path("/usr/bin/sudo.ws").exists() else "/usr/bin/sudo",
+)
+
+
+def apply_helper_command(manifest_path: Path) -> list[str]:
+    # sudo-rs on the Pi handles the narrow Python invocation more reliably than
+    # a shebang script rule with argument wildcards.
+    return [
+        SUDO_BIN,
+        "-n",
+        APPLY_HELPER_PYTHON,
+        APPLY_HELPER,
+        str(manifest_path),
+    ]
 
 
 @dataclass
@@ -105,7 +123,10 @@ class MaintenanceAgent:
         finally:
             self.clients.discard(writer)
             writer.close()
-            await writer.wait_closed()
+            try:
+                await writer.wait_closed()
+            except OSError:
+                pass
 
     async def handle_frame(self, frame: dict[str, Any]) -> None:
         command = str(frame.get("type", ""))
@@ -138,6 +159,8 @@ class MaintenanceAgent:
             await self.update_finalize(frame)
         elif command == "update_status":
             await self.update_status(frame)
+        elif command == "update_apply":
+            await self.update_apply(frame)
         elif command == "update_abort":
             await self.update_abort(frame)
         elif command == "close":
@@ -146,13 +169,25 @@ class MaintenanceAgent:
             raise MaintenanceProtocolError(f"unknown maintenance frame type {command!r}")
 
     async def open_session(self, frame: dict[str, Any]) -> None:
-        if self.session and self.session.is_open:
-            await self.close_session("replaced by new session", exit_status=None)
-
         now = time.time()
         expires_at = min(float(frame.get("expires_at", now + MAX_SESSION_SECONDS)), now + MAX_SESSION_SECONDS)
         nonce = str(frame.get("nonce") or new_nonce())
         session_id = str(frame.get("session_id") or nonce)
+
+        if self.session and self.session.is_open:
+            if self.session.session_id == session_id:
+                self.session.touch()
+                self.session.replay.accept(int(frame.get("seq", 0)))
+                await self.broadcast({
+                    "type": "opened",
+                    "session_id": session_id,
+                    "nonce": self.session.nonce,
+                    "existing": True,
+                    "timestamp": now,
+                })
+                return
+            await self.close_session("replaced by new session", exit_status=None)
+
         session = ShellSession(session_id=session_id, nonce=nonce, created_at=now, last_activity=now)
         session.replay.accept(int(frame.get("seq", 0)))
 
@@ -415,6 +450,48 @@ class MaintenanceAgent:
                 "timestamp": time.time(),
             }
         session.touch()
+        await self.broadcast(payload)
+
+    async def update_apply(self, frame: dict[str, Any]) -> None:
+        session = self._require_session(frame)
+        update_id = self._safe_update_id(str(frame.get("update_id") or frame.get("updateId") or ""))
+        manifest_path = (self.update_root / update_id / "manifest.json").resolve()
+        if not str(manifest_path).startswith(str(self.update_root.resolve()) + os.sep):
+            raise MaintenanceProtocolError("manifest outside update root")
+        if not manifest_path.exists():
+            raise MaintenanceProtocolError("verified update manifest missing")
+
+        await self.broadcast({
+            "type": "update_apply_started",
+            "session_id": session.session_id,
+            "update_id": update_id,
+            "timestamp": time.time(),
+        })
+
+        process = await asyncio.create_subprocess_exec(
+            *apply_helper_command(manifest_path),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await process.communicate()
+        stdout_text = stdout.decode("utf-8", errors="replace").strip()
+        stderr_text = stderr.decode("utf-8", errors="replace").strip()
+        session.touch()
+
+        payload: dict[str, Any] = {
+            "type": "update_applied" if process.returncode == 0 else "update_apply_failed",
+            "session_id": session.session_id,
+            "update_id": update_id,
+            "exit_status": process.returncode,
+            "timestamp": time.time(),
+        }
+        if stdout_text:
+            try:
+                payload["result"] = json.loads(stdout_text.splitlines()[-1])
+            except Exception:
+                payload["stdout"] = stdout_text[-1000:]
+        if stderr_text:
+            payload["stderr"] = stderr_text[-1000:]
         await self.broadcast(payload)
 
     async def update_abort(self, frame: dict[str, Any]) -> None:

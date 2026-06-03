@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from bbb_maint_agent import MaintenanceAgent, ShellSession
+from bbb_maint_agent import MaintenanceAgent, ShellSession, apply_helper_command
 from src.maintenance_protocol import MaintenanceProtocolError
 
 
@@ -20,6 +20,52 @@ class RunningProcess:
 
 
 class MaintenanceAgentLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_update_apply_uses_python_helper_sudo_invocation(self):
+        command = apply_helper_command(Path("/tmp/update/manifest.json"))
+
+        self.assertEqual(command[0:4], [
+            "/usr/bin/sudo",
+            "-n",
+            "/usr/bin/python3",
+            "/opt/rotorsync-maint-apply",
+        ])
+        self.assertEqual(command[-1], "/tmp/update/manifest.json")
+
+    async def test_same_session_open_is_idempotent(self):
+        agent = MaintenanceAgent()
+        current_session = ShellSession(
+            session_id="session",
+            nonce="nonce",
+            created_at=1,
+            last_activity=1,
+            process=RunningProcess(),
+        )
+        broadcasts = []
+        closed = []
+
+        async def broadcast(payload):
+            broadcasts.append(payload)
+
+        async def close_session(reason, exit_status):
+            closed.append((reason, exit_status))
+
+        agent.session = current_session
+        agent.broadcast = broadcast
+        agent.close_session = close_session
+
+        await agent.open_session({
+            "session_id": "session",
+            "nonce": "new-nonce-ignored",
+            "seq": 1,
+        })
+
+        self.assertIs(agent.session, current_session)
+        self.assertEqual(closed, [])
+        self.assertEqual(broadcasts[-1]["type"], "opened")
+        self.assertEqual(broadcasts[-1]["session_id"], "session")
+        self.assertTrue(broadcasts[-1]["existing"])
+        self.assertEqual(broadcasts[-1]["nonce"], "nonce")
+
     async def test_stale_stdout_pump_does_not_close_replacement_session(self):
         agent = MaintenanceAgent()
         old_session = ShellSession(
