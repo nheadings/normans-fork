@@ -1,0 +1,7 @@
+# RotorSync maintenance agent may only run bounded service/update actions.
+pi ALL=(root) NOPASSWD: /bin/systemctl status rotorsync.service
+pi ALL=(root) NOPASSWD: /bin/systemctl restart rotorsync.service
+pi ALL=(root) NOPASSWD: /bin/systemctl status iol_dashboard.service
+pi ALL=(root) NOPASSWD: /bin/systemctl restart iol_dashboard.service
+pi ALL=(root) NOPASSWD: /usr/bin/journalctl -u rotorsync.service *
+pi ALL=(root) NOPASSWD: /usr/bin/journalctl -u iol_dashboard.service *

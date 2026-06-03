@@ -8,10 +8,12 @@ Exposes requested/actual gallons from dashboard
 
 """
 import asyncio
+import base64
 import csv
 import json
 import logging
 import os
+from collections import deque
 from pathlib import Path
 import subprocess
 import socket
@@ -29,6 +31,11 @@ from bumble.core import UUID, AdvertisingData
 from src.mopeka_converter import mm_to_gallons, init as mopeka_init, reload as mopeka_reload
 from src.bluetooth_adapter_selection import list_bluetooth_adapters, select_adapters
 from src.batchmix_payload import batchmix_validation_error
+from src.dashboard_polling import (
+    HISTORY_POLL_INTERVAL,
+    STATUS_POLL_INTERVAL_IDLE,
+    dashboard_poll_interval,
+)
 
 # Configuration - Use MAC addresses to find adapters dynamically
 GATT_ADAPTER_MAC = 'E8:EA:6A:BD:E7:4F'  # USB adapter used for RotorSync GATT server
@@ -50,7 +57,6 @@ SCAN_TIMEOUT = 5
 BMS_TIMEOUT = 8
 SCAN_INTERVAL = 15
 BMS_READ_INTERVAL = 20  # 20 * 15s scan interval = 5 minutes
-STATUS_POLL_INTERVAL = 0.2  # Poll dashboard for status every 2 seconds
 STARTUP_DASHBOARD_WAIT_SECONDS = 30
 STARTUP_DASHBOARD_RETRY_INTERVAL = 0.5
 
@@ -78,6 +84,9 @@ CONFIG_DATA_CHAR_UUID = UUID('12345678-1234-5678-1234-56789abcdefc') # Config da
 STATE_CHAR_UUID = UUID('12345678-1234-5678-1234-56789abcdefd')      # Live iOS-friendly dashboard state
 COMMAND_CHAR_UUID = UUID('12345678-1234-5678-1234-56789abcdefe')    # JSON command channel for iOS app
 CONFIG_NOTIFY_CHAR_UUID = UUID('12345678-1234-5678-1234-56789abcdeff')  # Config response notify/read
+MAINT_CONTROL_CHAR_UUID = UUID('12345678-1234-5678-1234-56789abcdf00')  # Maintenance shell control/session
+MAINT_STDIN_CHAR_UUID = UUID('12345678-1234-5678-1234-56789abcdf01')    # Maintenance shell stdin chunks
+MAINT_STDOUT_CHAR_UUID = UUID('12345678-1234-5678-1234-56789abcdf02')   # Maintenance shell stdout notify/read
 
 # File paths for mopeka data
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -137,6 +146,11 @@ def _encode_ble_state_payload(state):
 config_response = '{"ok":false,"error":"No command issued"}'
 config_response_pages = []  # Pre-computed pages for paginated responses
 config_notify_char = None
+maintenance_stdout_char = None
+maintenance_response = '{"ok":false,"error":"No maintenance command issued"}'
+maintenance_read_chunks = deque()
+maintenance_active_sessions = set()
+maintenance_notify_pending = False
 ble_device = None
 dashboard_ready = False
 last_dashboard_error_log = 0.0
@@ -145,6 +159,11 @@ last_dashboard_error_message = None
 # Chunked config command buffer
 config_cmd_chunks = {}
 config_cmd_chunk_timeout = 30
+maintenance_write_buffers = {}
+maintenance_chunk_buffers = {}
+maintenance_chunk_timeout = 30
+maintenance_stdout_notify_spacing = 0.30
+maintenance_last_stdout_notify_time = 0.0
 
 def _redact_dashboard_command(cmd):
     """Redact sensitive fields (like WiFi password) from command logs."""
@@ -464,6 +483,20 @@ def make_config_notify_read_handler():
     return read_value
 
 
+def make_maintenance_stdout_read_handler():
+    def read_value(connection):
+        global maintenance_response
+        if maintenance_read_chunks:
+            value = maintenance_read_chunks.popleft()
+            maintenance_response = value
+            _schedule_maintenance_output_notify()
+        else:
+            value = maintenance_response
+        print(f'ReadValue maintenance_stdout: {value[:120]}', flush=True)
+        return bytes(value, 'utf-8')
+    return read_value
+
+
 def _connection_key(connection):
     for attr in ('peer_address', 'address', 'handle'):
         value = getattr(connection, attr, None)
@@ -486,6 +519,203 @@ def _notify_config_response():
         asyncio.get_running_loop().create_task(_notify())
     except RuntimeError:
         pass
+
+
+def _notify_maintenance_response():
+    if not ble_device or not maintenance_stdout_char:
+        return
+
+    async def _notify():
+        try:
+            await ble_device.notify_subscribers(maintenance_stdout_char, maintenance_response.encode('utf-8'))
+            print(f'Notified maintenance_stdout: {maintenance_response[:120]}', flush=True)
+        except Exception as e:
+            print(f'Maintenance notify error: {e}', flush=True)
+
+    try:
+        asyncio.get_running_loop().create_task(_notify())
+    except RuntimeError:
+        pass
+
+
+def _schedule_maintenance_output_notify(delay=0.0):
+    global maintenance_notify_pending
+    if maintenance_notify_pending:
+        return
+    maintenance_notify_pending = True
+
+    async def _notify_next():
+        global maintenance_notify_pending, maintenance_response, maintenance_last_stdout_notify_time
+        requested_delay = max(delay, 0.0)
+        try:
+            while maintenance_read_chunks and ble_device and maintenance_stdout_char:
+                elapsed = time.monotonic() - maintenance_last_stdout_notify_time
+                notify_delay = max(requested_delay, maintenance_stdout_notify_spacing - elapsed)
+                if notify_delay > 0:
+                    await asyncio.sleep(notify_delay)
+                requested_delay = 0.0
+                maintenance_response = maintenance_read_chunks.popleft()
+                await ble_device.notify_subscribers(maintenance_stdout_char, maintenance_response.encode('utf-8'))
+                maintenance_last_stdout_notify_time = time.monotonic()
+                print(f'Notified maintenance_stdout queued: {maintenance_response[:120]}', flush=True)
+        except Exception as e:
+            print(f'Maintenance notify error: {e}', flush=True)
+        finally:
+            maintenance_notify_pending = False
+            if maintenance_read_chunks:
+                _schedule_maintenance_output_notify(maintenance_stdout_notify_spacing)
+
+    try:
+        asyncio.get_running_loop().create_task(_notify_next())
+    except RuntimeError:
+        maintenance_notify_pending = False
+
+
+def _queue_maintenance_response_text(text):
+    global maintenance_response
+    maintenance_read_chunks.append(text)
+    while len(maintenance_read_chunks) > 300:
+        maintenance_read_chunks.popleft()
+    if len(maintenance_read_chunks) == 1:
+        maintenance_response = text
+    _schedule_maintenance_output_notify()
+
+
+def _set_maintenance_response_obj(obj):
+    global maintenance_response
+    maintenance_response = json.dumps(obj, separators=(',', ':'))
+    _notify_maintenance_response()
+
+
+async def maintenance_agent_bridge_loop():
+    """Keep a local TCP connection to bbb-maint-agent and notify BLE output."""
+    global maintenance_writer
+    while True:
+        try:
+            print('Connecting to bbb-maint-agent on 127.0.0.1:18991...', flush=True)
+            reader, writer = await asyncio.open_connection('127.0.0.1', 18991)
+            maintenance_writer = writer
+            _set_maintenance_response_obj({'type': 'bridge_status', 'status': 'connected', 'timestamp': time.time()})
+            while True:
+                line = await reader.readline()
+                if not line:
+                    break
+                try:
+                    text = line.decode('utf-8').strip()
+                except UnicodeDecodeError:
+                    text = json.dumps({'type': 'error', 'message': 'maintenance agent sent non-utf8 output'})
+                print(f'Maintenance agent output: {text[:160]}', flush=True)
+                _queue_maintenance_response_text(text)
+        except Exception as e:
+            _set_maintenance_response_obj({'type': 'bridge_status', 'status': 'disconnected', 'error': str(e), 'timestamp': time.time()})
+            await asyncio.sleep(2)
+        finally:
+            maintenance_writer = None
+
+
+def _schedule_maintenance_agent_frame(frame_text):
+    async def _send():
+        global maintenance_writer
+        if maintenance_writer is None:
+            _set_maintenance_response_obj({'type': 'error', 'message': 'bbb-maint-agent is not connected', 'timestamp': time.time()})
+            return
+        try:
+            maintenance_writer.write(frame_text.encode('utf-8') + b'\n')
+            await maintenance_writer.drain()
+        except Exception as e:
+            _set_maintenance_response_obj({'type': 'error', 'message': f'maintenance bridge write failed: {e}', 'timestamp': time.time()})
+
+    try:
+        asyncio.get_running_loop().create_task(_send())
+    except RuntimeError:
+        pass
+
+
+def _handle_maintenance_agent_write(connection, value, channel):
+    key = f'{_connection_key(connection)}:{channel}'
+    try:
+        chunk = value.decode('utf-8')
+        if chunk.startswith('MCHUNK:'):
+            parts = chunk.split(':', 3)
+            if len(parts) != 4:
+                print(f'Maintenance {channel} invalid chunk header', flush=True)
+                return
+            _, message_id, chunk_info, chunk_data = parts
+            try:
+                chunk_num_str, total_str = chunk_info.split('/', 1)
+                chunk_num = int(chunk_num_str)
+                total_chunks = int(total_str)
+            except ValueError:
+                print(f'Maintenance {channel} invalid chunk info {chunk_info!r}', flush=True)
+                return
+            if chunk_num < 1 or total_chunks < 1 or chunk_num > total_chunks or total_chunks > 200:
+                print(f'Maintenance {channel} invalid chunk range {chunk_info!r}', flush=True)
+                return
+
+            chunk_key = f'{key}:{message_id}'
+            now = time.time()
+            stale_keys = [
+                existing_key for existing_key, existing in maintenance_chunk_buffers.items()
+                if now - existing.get('timestamp', now) > maintenance_chunk_timeout
+            ]
+            for stale_key in stale_keys:
+                maintenance_chunk_buffers.pop(stale_key, None)
+
+            buffer = maintenance_chunk_buffers.get(chunk_key)
+            if not buffer or buffer.get('total') != total_chunks:
+                buffer = {'total': total_chunks, 'chunks': {}, 'timestamp': now}
+                maintenance_chunk_buffers[chunk_key] = buffer
+            buffer['chunks'][chunk_num] = chunk_data
+            buffer['timestamp'] = now
+            print(f'Maintenance {channel} chunk {chunk_num}/{total_chunks} id={message_id}', flush=True)
+
+            if len(buffer['chunks']) != total_chunks:
+                return
+
+            encoded = ''.join(buffer['chunks'][index] for index in range(1, total_chunks + 1))
+            maintenance_chunk_buffers.pop(chunk_key, None)
+            try:
+                data_str = base64.b64decode(encoded.encode('ascii')).decode('utf-8')
+            except Exception as e:
+                print(f'Maintenance {channel} chunk decode error: {e}', flush=True)
+                _set_maintenance_response_obj({
+                    'type': 'error',
+                    'message': f'maintenance {channel} chunk decode failed',
+                    'timestamp': time.time(),
+                })
+                return
+        else:
+            data_str = (maintenance_write_buffers.get(key, '') + chunk).strip()
+        try:
+            json.loads(data_str)
+        except json.JSONDecodeError:
+            if len(data_str) > 8192:
+                maintenance_write_buffers.pop(key, None)
+                print(f'Maintenance {channel} error: partial JSON exceeded 8192 bytes', flush=True)
+                _set_maintenance_response_obj({
+                    'type': 'error',
+                    'message': f'maintenance {channel} frame exceeded chunk buffer',
+                    'timestamp': time.time(),
+                })
+            else:
+                maintenance_write_buffers[key] = data_str
+                print(f'Maintenance {channel} chunk buffered: {len(data_str)} bytes', flush=True)
+            return
+
+        maintenance_write_buffers.pop(key, None)
+        print(f'Maintenance {channel} write: {data_str[:160]}', flush=True)
+        _schedule_maintenance_agent_frame(data_str)
+    except Exception as e:
+        maintenance_write_buffers.pop(key, None)
+        print(f'Maintenance {channel} error: {e}', flush=True)
+
+
+def maintenance_control_write_handler(connection, value):
+    _handle_maintenance_agent_write(connection, value, 'control')
+
+
+def maintenance_stdin_write_handler(connection, value):
+    _handle_maintenance_agent_write(connection, value, 'stdin')
 
 
 def _set_config_response_obj(obj):
@@ -2077,26 +2307,28 @@ def jbd_cmd(func):
 
 async def poll_dashboard_status(device, state_char):
     """Periodically poll dashboard state and notify subscribers on change."""
-    poll_count = 0
+    last_history_poll = 0.0
     last_notified_state_json = dashboard_status.get('state_json', '{}')
     while True:
+        sleep_interval = STATUS_POLL_INTERVAL_IDLE
         try:
             updated = query_dashboard_status()
             current_state_json = dashboard_status.get('state_json', '{}')
+            sleep_interval = dashboard_poll_interval(dashboard_status.get('state'))
             if updated and current_state_json != last_notified_state_json:
                 await device.notify_subscribers(
                     state_char,
                     bytes(current_state_json, 'utf-8'),
                 )
                 last_notified_state_json = current_state_json
-            # Poll history every 50 cycles (~10 seconds at 0.2s interval)
-            poll_count += 1
-            if poll_count >= 50:
+
+            now = time.time()
+            if now - last_history_poll >= HISTORY_POLL_INTERVAL:
                 query_fill_history()
-                poll_count = 0
+                last_history_poll = now
         except Exception as e:
             print(f'Status poll error: {e}', flush=True)
-        await asyncio.sleep(STATUS_POLL_INTERVAL)
+        await asyncio.sleep(sleep_interval)
 
 async def read_sensors(sensor_device, sensor_adapter):
     global sensor_data, sensor_loop_heartbeat
@@ -2218,7 +2450,7 @@ async def monitor_sensor_health(sensor_task):
             os._exit(1)
 
 async def main():
-    global ble_device, config_notify_char
+    global ble_device, config_notify_char, maintenance_stdout_char
     print('Starting Rotorsync GATT server (Bumble)...', flush=True)
     # Initialize Mopeka gallon converter
     mopeka_init()
@@ -2349,6 +2581,24 @@ async def main():
         Characteristic.READABLE,
         CharacteristicValue(read=make_config_notify_read_handler()),
     )
+    maint_control_char = Characteristic(
+        MAINT_CONTROL_CHAR_UUID,
+        Characteristic.Properties.WRITE | Characteristic.Properties.WRITE_WITHOUT_RESPONSE,
+        Characteristic.WRITEABLE,
+        CharacteristicValue(write=maintenance_control_write_handler),
+    )
+    maint_stdin_char = Characteristic(
+        MAINT_STDIN_CHAR_UUID,
+        Characteristic.Properties.WRITE | Characteristic.Properties.WRITE_WITHOUT_RESPONSE,
+        Characteristic.WRITEABLE,
+        CharacteristicValue(write=maintenance_stdin_write_handler),
+    )
+    maintenance_stdout_char = Characteristic(
+        MAINT_STDOUT_CHAR_UUID,
+        Characteristic.Properties.READ | Characteristic.Properties.NOTIFY,
+        Characteristic.READABLE,
+        CharacteristicValue(read=make_maintenance_stdout_read_handler()),
+    )
 
     service = Service(
         SERVICE_UUID,
@@ -2368,9 +2618,13 @@ async def main():
             config_cmd_char,
             config_data_char,
             config_notify_char,
+            maint_control_char,
+            maint_stdin_char,
+            maintenance_stdout_char,
         ],
     )
     device.add_service(service)
+    asyncio.create_task(maintenance_agent_bridge_loop())
     if await wait_for_dashboard_ready():
         print('Dashboard socket is ready', flush=True)
     else:
@@ -2386,7 +2640,7 @@ async def main():
     print(f'BLE name: {ble_name}', flush=True)
 
     adv_data = AdvertisingData([
-        (AdvertisingData.INCOMPLETE_LIST_OF_128_BIT_SERVICE_CLASS_UUIDS, bytes(SERVICE_UUID)),
+        (AdvertisingData.COMPLETE_LIST_OF_128_BIT_SERVICE_CLASS_UUIDS, bytes(SERVICE_UUID)),
     ])
     scan_response = AdvertisingData([
         (AdvertisingData.COMPLETE_LOCAL_NAME, ble_name.encode('utf-8')),

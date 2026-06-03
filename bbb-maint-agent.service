@@ -1,0 +1,20 @@
+[Unit]
+Description=BBB Maintenance Shell Sidecar
+After=network.target
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/home/pi
+RuntimeDirectory=bbb-maint-agent
+RuntimeDirectoryMode=0750
+Environment=BBB_MAINT_SOCKET=/run/bbb-maint-agent/agent.sock
+ExecStart=/usr/bin/python3 /opt/bbb_maint_agent.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

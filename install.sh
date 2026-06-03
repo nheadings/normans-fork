@@ -373,6 +373,7 @@ sudo mkdir -p "$OPT_DIR/mopeka"
 
 # Copy dashboard/runtime files
 copy_if_needed "$SCRIPT_DIR/dashboard.py" "$INSTALL_DIR/dashboard.py"
+copy_if_needed "$SCRIPT_DIR/bbb_maint_agent.py" "$INSTALL_DIR/bbb_maint_agent.py"
 copy_if_needed "$SCRIPT_DIR/config.py" "$INSTALL_DIR/config.py"
 copy_if_needed "$SCRIPT_DIR/VERSION" "$INSTALL_DIR/VERSION"
 copy_if_needed "$SCRIPT_DIR/iolhat.py" "$INSTALL_DIR/iolhat.py"
@@ -386,8 +387,10 @@ copy_if_needed "$SCRIPT_DIR/install.sh" "$INSTALL_DIR/install.sh"
 
 # Copy Rotorsync runtime files to /opt to match service paths
 sudo cp "$SCRIPT_DIR/rotorsync_bumble.py" "$OPT_DIR/rotorsync_bumble.py"
+sudo cp "$SCRIPT_DIR/bbb_maint_agent.py" "$OPT_DIR/bbb_maint_agent.py"
 sudo cp "$SCRIPT_DIR/rotorsync_watchdog.py" "$OPT_DIR/rotorsync_watchdog.py"
 sudo cp "$SCRIPT_DIR/src/__init__.py" "$OPT_DIR/src/"
+sudo cp "$SCRIPT_DIR/src/maintenance_protocol.py" "$OPT_DIR/src/maintenance_protocol.py"
 sudo cp "$SCRIPT_DIR/src/mopeka_converter.py" "$OPT_DIR/src/mopeka_converter.py"
 for mopeka_file in "$SCRIPT_DIR"/mopeka/*; do
     [ -f "$mopeka_file" ] || continue
@@ -398,7 +401,7 @@ for mopeka_file in "$SCRIPT_DIR"/mopeka/*; do
     fi
     sudo cp "$mopeka_file" "$OPT_DIR/mopeka/"
 done
-sudo chmod 755 "$OPT_DIR/rotorsync_bumble.py" "$OPT_DIR/rotorsync_watchdog.py"
+sudo chmod 755 "$OPT_DIR/rotorsync_bumble.py" "$OPT_DIR/bbb_maint_agent.py" "$OPT_DIR/rotorsync_watchdog.py"
 
 # Copy optional files
 [ -f "$SCRIPT_DIR/bbb_diagram_rotated.jpeg" ] && copy_if_needed "$SCRIPT_DIR/bbb_diagram_rotated.jpeg" "$INSTALL_DIR/bbb_diagram_rotated.jpeg"
@@ -413,10 +416,17 @@ chmod +x "$INSTALL_DIR/dashboard.py"
 log_step "6/7: Installing systemd service..."
 
 sudo cp "$SCRIPT_DIR/iol_dashboard.service" /etc/systemd/system/
+sudo cp "$SCRIPT_DIR/bbb-maint-agent.service" /etc/systemd/system/
 sudo cp "$SCRIPT_DIR/rotorsync.service" /etc/systemd/system/
 sudo cp "$SCRIPT_DIR/rotorsync_watchdog.service" /etc/systemd/system/
+if [ -f "$SCRIPT_DIR/deploy/bbb-maint-agent-sudoers" ]; then
+    sudo cp "$SCRIPT_DIR/deploy/bbb-maint-agent-sudoers" /etc/sudoers.d/bbb-maint-agent
+    sudo chmod 440 /etc/sudoers.d/bbb-maint-agent
+    sudo visudo -cf /etc/sudoers.d/bbb-maint-agent >/dev/null
+fi
 sudo systemctl daemon-reload
 sudo systemctl enable iol_dashboard.service
+sudo systemctl enable bbb-maint-agent.service
 sudo systemctl enable rotorsync.service
 sudo systemctl enable rotorsync_watchdog.service
 
@@ -477,6 +487,7 @@ fi
 
 # Start services now so the system is usable immediately after install.
 sudo systemctl restart iol_dashboard.service || log_warn "Could not start iol_dashboard.service"
+sudo systemctl restart bbb-maint-agent.service || log_warn "Could not start bbb-maint-agent.service"
 sudo systemctl restart rotorsync.service || log_warn "Could not start rotorsync.service"
 sudo systemctl restart rotorsync_watchdog.service || log_warn "Could not start rotorsync_watchdog.service"
 
@@ -488,14 +499,15 @@ log_info "=========================================="
 echo ""
 log_info "Dashboard installed to: $INSTALL_DIR"
 log_info "Rotorsync installed to: $OPT_DIR"
-log_info "Services enabled: iol_dashboard.service, rotorsync.service, rotorsync_watchdog.service"
+log_info "Services enabled: iol_dashboard.service, bbb-maint-agent.service, rotorsync.service, rotorsync_watchdog.service"
 echo ""
 log_info "Next steps:"
 log_info "  1. Reboot: sudo reboot"
 log_info "  2. Check status: systemctl status iol_dashboard.service"
 log_info "  3. Check BLE status: systemctl status rotorsync.service"
-log_info "  4. After reboot, confirm serial: ls -l /dev/ttyAMA0"
-log_info "  5. View logs: tail -f ~/iol_dashboard.log"
+log_info "  4. Check maintenance sidecar: systemctl status bbb-maint-agent.service"
+log_info "  5. After reboot, confirm serial: ls -l /dev/ttyAMA0"
+log_info "  6. View logs: tail -f ~/iol_dashboard.log"
 echo ""
 
 read -p "Reboot now? (y/n) " -n 1 -r
