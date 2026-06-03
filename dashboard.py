@@ -13,6 +13,7 @@ import json
 import csv
 import shlex
 import builtins
+import math
 from collections import deque
 from pathlib import Path
 from PIL import Image, ImageTk
@@ -1111,6 +1112,49 @@ def adjust_batch_mix_gallons(delta, source):
     root.after(0, update_batch_mix_overlay)
     root.after(0, lambda value=water_needed: draw_requested_number(_format_batch_mix_target(value), "red"))
     return True
+
+def set_requested_gallons_value(value, source):
+    """Set requested gallons exactly from a remote dashboard command."""
+    global batch_mix_data, requested_gallons, fill_requested_gallons, mix_requested_gallons
+    global colors_are_green
+
+    try:
+        target = float(value)
+    except (TypeError, ValueError):
+        raise ValueError("requested gallons must be a number")
+
+    if not math.isfinite(target):
+        raise ValueError("requested gallons must be finite")
+
+    # Keep the remote control inside the same practical range as the display workflow.
+    target = max(0.0, min(10000.0, target))
+
+    if _batch_mix_payload_active():
+        water_needed = max(1.0, target)
+        batch_mix_data = scaled_batchmix_payload_for_water(batch_mix_data, water_needed)
+        requested_gallons = float(batch_mix_data.get("water_needed", water_needed))
+        mix_requested_gallons = requested_gallons
+        root.after(0, update_batch_mix_overlay)
+        display_value = _format_batch_mix_target(requested_gallons)
+    else:
+        requested_gallons = target
+        if current_mode == "fill":
+            fill_requested_gallons = requested_gallons
+        else:
+            mix_requested_gallons = requested_gallons
+        display_value = f"{requested_gallons:.0f}"
+
+    colors_are_green = False
+    save_mode_presets()
+    msg = f"{source}: Set requested gallons to {requested_gallons:.3f}"
+    print(msg)
+    try:
+        with open(debug_log, "a") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+    except Exception:
+        pass
+    root.after(0, lambda value=display_value: draw_requested_number(value, "red"))
+    return requested_gallons
 
 def _format_batch_mix_product_amount(ounces):
     """Format product volume as gallons and ounces for display."""
@@ -2271,7 +2315,42 @@ def _build_dashboard_state_snapshot():
         "mopeka_enabled": bool(mopeka_enabled),
         "mopeka_connected": bool(mopeka_connected),
         "last_loads_gal": [round(load, 3) for load in last_loads_gallons[:3]],
+        "current_curve": flow_curve_status_text(),
+        "pending_curve": flow_curve_proposal_status_text(),
     }
+
+
+def _build_fill_history_items(limit=5):
+    """Return recent fill rows with thumbs-confirmation status."""
+    history_items = []
+
+    try:
+        with open("/home/pi/fill_history.log", "r") as hf:
+            all_lines = hf.readlines()
+            last_lines = all_lines[-limit:] if len(all_lines) >= limit else all_lines
+            for entry in last_lines:
+                parts = entry.strip().split("|")
+                if len(parts) >= 3:
+                    ts = parts[0].strip()
+                    req = parts[1].replace("Requested:", "").replace("gal", "").strip()
+                    act = parts[2].replace("Actual:", "").replace("gal", "").strip()
+                    shutoff_type = parts[4].strip() if len(parts) >= 5 else ""
+                    history_items.append((ts, req, act, "accepted", shutoff_type))
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        print(f"Fill history parse error: {exc}", flush=True)
+
+    if pending_fill_gallons > 0:
+        history_items.append((
+            "Pending thumbs",
+            f"{pending_fill_requested:.3f}",
+            f"{pending_fill_gallons:.3f}",
+            "pending",
+            pending_fill_shutoff_type,
+        ))
+
+    return history_items[-limit:]
 
 
 def _save_calibration_run():
@@ -5002,19 +5081,12 @@ def socket_command_listener():
 
                             elif line == "HISTORY":
                                 try:
-                                    with open("/home/pi/fill_history.log", "r") as hf:
-                                        all_lines = hf.readlines()
-                                        last_5 = all_lines[-5:] if len(all_lines) >= 5 else all_lines
-                                        history_items = []
-                                        for entry in last_5:
-                                            parts = entry.strip().split("|")
-                                            if len(parts) >= 3:
-                                                ts = parts[0].strip()
-                                                req = parts[1].replace("Requested:", "").replace("gal", "").strip()
-                                                act = parts[2].replace("Actual:", "").replace("gal", "").strip()
-                                                history_items.append(f"{ts},{req},{act}")
-                                        history_response = ";".join(history_items)
-                                        client.send(f"HIST:{history_response}\n".encode())
+                                    history_items = _build_fill_history_items()
+                                    history_response = ";".join(
+                                        ",".join(str(field).replace(",", " ") for field in item)
+                                        for item in history_items
+                                    )
+                                    client.send(f"HIST:{history_response}\n".encode())
                                 except Exception:
                                     client.send(b"HIST:\n")
                                 continue
@@ -5039,6 +5111,16 @@ def socket_command_listener():
                                         f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
                                 except ValueError:
                                     pass
+
+                            elif line.startswith("SET_REQUESTED_GALLONS:"):
+                                try:
+                                    value = line.split(":", 1)[1].strip()
+                                    new_value = set_requested_gallons_value(value, "Socket")
+                                    client.send(f"REQ_SET:{new_value:.3f}\n".encode())
+                                except Exception as exc:
+                                    err_payload = {"code": "INVALID_REQUESTED_GALLONS", "message": str(exc)}
+                                    client.send(f"REQ_ERR:{json.dumps(err_payload, separators=(',', ':'))}\n".encode())
+                                continue
 
                             elif line == 'PS':
                                 msg = "Socket: Pump Stop command received"

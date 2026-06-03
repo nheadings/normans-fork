@@ -9,7 +9,9 @@ run remote shell work.
 from __future__ import annotations
 
 import asyncio
+import base64
 import fcntl
+import hashlib
 import json
 import os
 import pwd
@@ -42,6 +44,8 @@ PORT = int(os.environ.get("BBB_MAINT_AGENT_PORT", "18991"))
 SHELL = os.environ.get("BBB_MAINT_SHELL", "/bin/bash")
 PI_USER = os.environ.get("BBB_MAINT_USER", "pi")
 MAX_FILE_BYTES = 64 * 1024
+MAX_UPDATE_BYTES = int(os.environ.get("BBB_MAINT_MAX_UPDATE_BYTES", str(40 * 1024 * 1024)))
+UPDATE_ROOT = Path(os.environ.get("BBB_MAINT_UPDATE_ROOT", "/home/pi/.rotorsync-maintenance-updates"))
 
 
 @dataclass
@@ -63,10 +67,24 @@ class ShellSession:
         self.last_activity = time.time()
 
 
+@dataclass
+class UpdateTransfer:
+    update_id: str
+    expected_size: int
+    expected_sha256: str
+    part_path: Path
+    final_path: Path
+    manifest_path: Path
+    received: int = 0
+    started_at: float = field(default_factory=time.time)
+
+
 class MaintenanceAgent:
     def __init__(self) -> None:
         self.session: ShellSession | None = None
         self.clients: set[asyncio.StreamWriter] = set()
+        self.update_root = UPDATE_ROOT
+        self.active_update: UpdateTransfer | None = None
 
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         self.clients.add(writer)
@@ -112,6 +130,16 @@ class MaintenanceAgent:
             await self.file_get(frame)
         elif command == "file_put":
             await self.file_put(frame)
+        elif command == "update_begin":
+            await self.update_begin(frame)
+        elif command == "update_chunk":
+            await self.update_chunk(frame)
+        elif command == "update_finalize":
+            await self.update_finalize(frame)
+        elif command == "update_status":
+            await self.update_status(frame)
+        elif command == "update_abort":
+            await self.update_abort(frame)
         elif command == "close":
             await self.close_session("closed by remote", exit_status=None)
         else:
@@ -247,6 +275,165 @@ class MaintenanceAgent:
         session.touch()
         await self.broadcast({"type": "file_saved", "session_id": session.session_id, "path": str(path), "bytes": len(data)})
 
+    async def update_begin(self, frame: dict[str, Any]) -> None:
+        session = self._require_session(frame)
+        update_id = self._safe_update_id(str(frame.get("update_id") or frame.get("updateId") or ""))
+        expected_size = self._expected_update_size(frame.get("size"))
+        expected_sha256 = self._expected_sha256(str(frame.get("sha256") or ""))
+
+        update_dir = self.update_root / update_id
+        update_dir.mkdir(parents=True, exist_ok=True)
+        part_path = update_dir / "artifact.bin.part"
+        final_path = update_dir / "artifact.bin"
+        manifest_path = update_dir / "manifest.json"
+
+        for path in (part_path, final_path, manifest_path):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+
+        self.active_update = UpdateTransfer(
+            update_id=update_id,
+            expected_size=expected_size,
+            expected_sha256=expected_sha256,
+            part_path=part_path,
+            final_path=final_path,
+            manifest_path=manifest_path,
+        )
+        session.touch()
+        await self.broadcast({
+            "type": "update_started",
+            "session_id": session.session_id,
+            "update_id": update_id,
+            "size": expected_size,
+            "sha256": expected_sha256,
+            "timestamp": time.time(),
+        })
+
+    async def update_chunk(self, frame: dict[str, Any]) -> None:
+        session = self._require_session(frame)
+        transfer = self._require_update(str(frame.get("update_id") or frame.get("updateId") or ""))
+        offset = self._non_negative_int(frame.get("offset"), "invalid update chunk offset")
+        if offset != transfer.received:
+            raise MaintenanceProtocolError("update chunk offset mismatch")
+
+        data_b64 = str(frame.get("data_b64") or frame.get("dataBase64") or "")
+        try:
+            data = base64.b64decode(data_b64, validate=True)
+        except Exception as exc:
+            raise MaintenanceProtocolError("invalid update chunk data") from exc
+        if not data:
+            raise MaintenanceProtocolError("empty update chunk")
+        if transfer.received + len(data) > transfer.expected_size:
+            raise MaintenanceProtocolError("update chunk exceeds expected size")
+
+        with transfer.part_path.open("ab") as handle:
+            handle.write(data)
+        transfer.received += len(data)
+        session.touch()
+        await self.broadcast({
+            "type": "update_chunk_ack",
+            "session_id": session.session_id,
+            "update_id": transfer.update_id,
+            "offset": transfer.received,
+            "received": transfer.received,
+            "size": transfer.expected_size,
+            "timestamp": time.time(),
+        })
+
+    async def update_finalize(self, frame: dict[str, Any]) -> None:
+        session = self._require_session(frame)
+        transfer = self._require_update(str(frame.get("update_id") or frame.get("updateId") or ""))
+        if transfer.received != transfer.expected_size:
+            raise MaintenanceProtocolError("update transfer incomplete")
+
+        digest = hashlib.sha256()
+        with transfer.part_path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        actual_sha256 = digest.hexdigest()
+        if actual_sha256 != transfer.expected_sha256:
+            raise MaintenanceProtocolError("update sha256 mismatch")
+
+        transfer.part_path.replace(transfer.final_path)
+        manifest = {
+            "update_id": transfer.update_id,
+            "size": transfer.expected_size,
+            "sha256": actual_sha256,
+            "verified": True,
+            "verified_at": time.time(),
+            "artifact": str(transfer.final_path),
+        }
+        transfer.manifest_path.write_text(json.dumps(manifest, separators=(",", ":"), sort_keys=True))
+        self.active_update = None
+        session.touch()
+        await self.broadcast({
+            "type": "update_verified",
+            "session_id": session.session_id,
+            "update_id": transfer.update_id,
+            "size": transfer.expected_size,
+            "sha256": actual_sha256,
+            "artifact": str(transfer.final_path),
+            "timestamp": time.time(),
+        })
+
+    async def update_status(self, frame: dict[str, Any]) -> None:
+        session = self._require_session(frame)
+        update_id = str(frame.get("update_id") or frame.get("updateId") or "").strip()
+        if self.active_update and (not update_id or update_id == self.active_update.update_id):
+            transfer = self.active_update
+            payload = {
+                "type": "update_status",
+                "session_id": session.session_id,
+                "update_id": transfer.update_id,
+                "state": "receiving",
+                "received": transfer.received,
+                "size": transfer.expected_size,
+                "sha256": transfer.expected_sha256,
+                "timestamp": time.time(),
+            }
+        elif update_id:
+            manifest_path = self.update_root / self._safe_update_id(update_id) / "manifest.json"
+            payload = {
+                "type": "update_status",
+                "session_id": session.session_id,
+                "update_id": update_id,
+                "state": "verified" if manifest_path.exists() else "missing",
+                "timestamp": time.time(),
+            }
+            if manifest_path.exists():
+                try:
+                    payload.update(json.loads(manifest_path.read_text()))
+                except Exception:
+                    payload["state"] = "manifest_error"
+        else:
+            payload = {
+                "type": "update_status",
+                "session_id": session.session_id,
+                "state": "idle",
+                "timestamp": time.time(),
+            }
+        session.touch()
+        await self.broadcast(payload)
+
+    async def update_abort(self, frame: dict[str, Any]) -> None:
+        session = self._require_session(frame)
+        transfer = self._require_update(str(frame.get("update_id") or frame.get("updateId") or ""))
+        try:
+            transfer.part_path.unlink()
+        except FileNotFoundError:
+            pass
+        update_id = transfer.update_id
+        self.active_update = None
+        session.touch()
+        await self.broadcast({
+            "type": "update_aborted",
+            "session_id": session.session_id,
+            "update_id": update_id,
+            "timestamp": time.time(),
+        })
+
     def _safe_user_path(self, raw_path: str) -> Path:
         if not raw_path:
             raise MaintenanceProtocolError("missing file path")
@@ -259,6 +446,45 @@ class MaintenanceAgent:
         if not any(str(resolved).startswith(str(root)) for root in allowed_roots):
             raise MaintenanceProtocolError("file path outside allowed maintenance roots")
         return resolved
+
+    def _safe_update_id(self, raw_update_id: str) -> str:
+        update_id = raw_update_id.strip()
+        if not update_id:
+            raise MaintenanceProtocolError("missing update id")
+        if len(update_id) > 96 or any(ch not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-" for ch in update_id):
+            raise MaintenanceProtocolError("invalid update id")
+        return update_id
+
+    def _expected_update_size(self, raw_size: Any) -> int:
+        size = self._non_negative_int(raw_size, "invalid update size")
+        if size <= 0:
+            raise MaintenanceProtocolError("update size must be positive")
+        if size > MAX_UPDATE_BYTES:
+            raise MaintenanceProtocolError("update exceeds maximum allowed size")
+        return size
+
+    def _expected_sha256(self, value: str) -> str:
+        digest = value.strip().lower()
+        if len(digest) != 64 or any(ch not in "0123456789abcdef" for ch in digest):
+            raise MaintenanceProtocolError("invalid update sha256")
+        return digest
+
+    def _non_negative_int(self, value: Any, message: str) -> int:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError) as exc:
+            raise MaintenanceProtocolError(message) from exc
+        if parsed < 0:
+            raise MaintenanceProtocolError(message)
+        return parsed
+
+    def _require_update(self, update_id: str) -> UpdateTransfer:
+        if not self.active_update:
+            raise MaintenanceProtocolError("no active update transfer")
+        safe_update_id = self._safe_update_id(update_id)
+        if safe_update_id != self.active_update.update_id:
+            raise MaintenanceProtocolError("update id mismatch")
+        return self.active_update
 
     def _require_session(self, frame: dict[str, Any]) -> ShellSession:
         if not self.session or not self.session.is_open:
